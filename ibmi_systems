@@ -1,0 +1,17 @@
+# IBM i Systems Inventory
+# Used by playbooks/ibmi_ptf_status.yml when IBMi_Target = ALL
+#
+# Add IBM i LPARs below in the appropriate group.
+# The playbook targets the [ibmi_systems] group directly.
+# Sub-groups (Lab, Prod etc.) are children so hosts appear in both
+# the sub-group and ibmi_systems automatically.
+#
+# ansible_python_interpreter is set dynamically by the ibmi_ptf_status
+# role (auto-detects which Python has itoolkit) so no need to set it here.
+
+[ibmi_lab]
+192.168.127.228
+192.168.127.229
+
+[ibmi_systems:children]
+ibmi_lab
