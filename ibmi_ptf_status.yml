@@ -1,0 +1,96 @@
+---
+# Playbook: ibmi_ptf_status.yml
+#
+# Checks PTF status on one IBM i LPAR or all LPARs in the ibmi_systems group.
+# Non-destructive — read only, no changes made to any system.
+#
+# AWX survey variables:
+#   IBMi_Target   - hostname/IP of a single LPAR  OR  the keyword: ALL
+#   IBMi_User     - IBM i user profile to connect with
+#   IBMi_Password - password for IBMi_User (marked no_log)
+#
+# When IBMi_Target = ALL the playbook runs against the AWX inventory group
+# 'ibmi_systems'. All hosts in that group must be reachable with the same
+# IBMi_User / IBMi_Password credentials.
+
+# ── Play 1: Build dynamic inventory for single-host runs ─────────────────────
+# When IBMi_Target is a hostname/IP we inject it dynamically so the playbook
+# works from any AWX job template without a static inventory entry.
+# When IBMi_Target = ALL we skip this play and use the ibmi_systems group.
+
+- name: Register single IBM i LPAR (skipped when ALL)
+  hosts: localhost
+  gather_facts: false
+
+  tasks:
+    - name: Add single IBM i LPAR to in-memory inventory
+      ansible.builtin.add_host:
+        name: "{{ IBMi_Target }}"
+        ansible_host: "{{ IBMi_Target }}"
+        ansible_user: "{{ IBMi_User }}"
+        ansible_password: "{{ IBMi_Password }}"
+        ansible_python_interpreter: /QOpenSys/pkgs/bin/python3
+        # Note: the ibmi_ptf_status role overrides this at runtime to whichever
+        # Python version actually has itoolkit installed.
+        ansible_ssh_common_args: "-o StrictHostKeyChecking=no"
+        group: ibmi_dynamic
+      no_log: true
+      when: IBMi_Target | upper != 'ALL'
+
+# ── Play 2a: Run against single dynamically added host ───────────────────────
+
+- name: IBM i PTF status check — single host
+  hosts: ibmi_dynamic
+  gather_facts: false
+
+  tasks:
+    - name: Wait for SSH to be reachable
+      ansible.builtin.wait_for:
+        host: "{{ ansible_host }}"
+        port: 22
+        timeout: 120
+        sleep: 5
+      delegate_to: localhost
+
+    - name: Wait for connection and Python to be ready
+      ansible.builtin.wait_for_connection:
+        timeout: 300
+        connect_timeout: 30
+        sleep: 15
+
+    - name: Run PTF status checks
+      ansible.builtin.include_role:
+        name: ibmi_ptf_status
+
+# ── Play 2b: Run against all hosts in ibmi_systems inventory group ───────────
+
+- name: IBM i PTF status check — all hosts
+  hosts: "{{ 'ibmi_systems' if IBMi_Target | upper == 'ALL' else 'no_match_single_run' }}"
+  gather_facts: false
+
+  vars:
+    ansible_user: "{{ IBMi_User }}"
+    ansible_password: "{{ IBMi_Password }}"
+    ansible_python_interpreter: /QOpenSys/pkgs/bin/python3
+    # Note: the ibmi_ptf_status role overrides this at runtime to whichever
+    # Python version actually has itoolkit installed.
+    ansible_ssh_common_args: "-o StrictHostKeyChecking=no"
+
+  tasks:
+    - name: Wait for SSH to be reachable
+      ansible.builtin.wait_for:
+        host: "{{ ansible_host }}"
+        port: 22
+        timeout: 120
+        sleep: 5
+      delegate_to: localhost
+
+    - name: Wait for connection and Python to be ready
+      ansible.builtin.wait_for_connection:
+        timeout: 300
+        connect_timeout: 30
+        sleep: 15
+
+    - name: Run PTF status checks
+      ansible.builtin.include_role:
+        name: ibmi_ptf_status

@@ -1,0 +1,3 @@
+---
+# defaults file for ibmi_ptf_status
+IBMi_Name: "{{ inventory_hostname }}"

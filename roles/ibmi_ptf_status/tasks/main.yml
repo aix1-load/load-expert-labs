@@ -1,0 +1,186 @@
+---
+# tasks file for ibmi_ptf_status
+#
+# Checks PTF status on an IBM i LPAR using ibm.power_ibmi collection.
+# Non-destructive — read only, no changes made to the system.
+#
+# Collects:
+#   - OS version (auto-detected, works on 7.2-7.5)
+#   - CUM PTF level installed vs latest available
+#   - All installed group PTFs vs latest available from IBM catalog
+#   - PTF counts by status
+#   - PTFs pending IPL
+
+# ── 0. Preflight — verify itoolkit is installed ───────────────────────────────
+
+- name: Find Python interpreter that has itoolkit
+  ansible.builtin.shell:
+    cmd: |
+      for PY in /QOpenSys/pkgs/bin/python3 \
+                /QOpenSys/pkgs/bin/python3.9 \
+                /QOpenSys/pkgs/bin/python3.11 \
+                /QOpenSys/pkgs/bin/python3.13; do
+        [ -x "$PY" ] && "$PY" -c "import itoolkit" 2>/dev/null && echo "$PY" && exit 0
+      done
+      exit 1
+  register: r_itoolkit_check
+  changed_when: false
+  failed_when: false
+
+- name: Fail if itoolkit is missing from all Python versions
+  ansible.builtin.fail:
+    msg: >
+      The itoolkit Python package is not importable on {{ IBMi_Name | default(inventory_hostname) }}.
+      Checked: python3, python3.9, python3.11, python3.13 — none had itoolkit.
+      Fix: /QOpenSys/pkgs/bin/yum install python3-itoolkit
+  when: r_itoolkit_check.rc != 0
+
+- name: Set ansible_python_interpreter to the Python that has itoolkit
+  ansible.builtin.set_fact:
+    ansible_python_interpreter: "{{ r_itoolkit_check.stdout | trim }}"
+
+- name: Show active Python interpreter
+  ansible.builtin.debug:
+    msg: "Using Python interpreter: {{ ansible_python_interpreter }}"
+
+# ── 1. Detect OS version ──────────────────────────────────────────────────────
+
+- name: Get IBM i OS version from QSYS2.PTF_INFO
+  ibm.power_ibmi.ibmi_sql_query:
+    sql: >
+      SELECT PTF_PRODUCT_ID, PTF_PRODUCT_RELEASE_LEVEL
+      FROM QSYS2.PTF_INFO
+      WHERE PTF_PRODUCT_ID = '5770SS1'
+      FETCH FIRST 1 ROWS ONLY
+  register: r_os_version
+  changed_when: false
+  failed_when: false
+
+- name: Set OS version fact
+  ansible.builtin.set_fact:
+    ibmi_os_version: "{{ r_os_version.row[0].PTF_PRODUCT_RELEASE_LEVEL | default('UNKNOWN') }}"
+
+- name: Set CUM group ID based on OS version
+  ansible.builtin.set_fact:
+    ibmi_cum_group: >-
+      {%- if 'R5' in ibmi_os_version or '750' in ibmi_os_version -%}SF99738
+      {%- elif 'R4' in ibmi_os_version or '740' in ibmi_os_version -%}SF99727
+      {%- elif 'R3' in ibmi_os_version or '730' in ibmi_os_version -%}SF99722
+      {%- elif 'R2' in ibmi_os_version or '720' in ibmi_os_version -%}SF99713
+      {%- else -%}UNKNOWN
+      {%- endif -%}
+
+# ── 2. CUM PTF level ──────────────────────────────────────────────────────────
+
+- name: Warn if OS version could not be mapped to a CUM group
+  ansible.builtin.debug:
+    msg: "WARNING: OS version '{{ ibmi_os_version }}' could not be mapped to a CUM group — skipping CUM check."
+  when: ibmi_cum_group == 'UNKNOWN'
+
+- name: Check latest available CUM level from IBM catalog
+  ibm.power_ibmi.ibmi_fix_group_check:
+    groups:
+      - "{{ ibmi_cum_group }}"
+  register: r_cum
+  changed_when: false
+  failed_when: false
+  when: ibmi_cum_group != 'UNKNOWN'
+
+- name: Get installed CUM level from system
+  ibm.power_ibmi.ibmi_sql_query:
+    sql: >
+      SELECT PTF_GROUP_NAME, PTF_GROUP_LEVEL, PTF_GROUP_STATUS
+      FROM QSYS2.GROUP_PTF_INFO
+      WHERE PTF_GROUP_NAME = '{{ ibmi_cum_group }}'
+      FETCH FIRST 1 ROWS ONLY
+  register: r_cum_installed
+  changed_when: false
+  failed_when: false
+  when: ibmi_cum_group != 'UNKNOWN'
+
+# ── 3. All installed group PTFs ───────────────────────────────────────────────
+# Query all group PTFs installed on this system — no hardcoded IDs needed.
+# Then check latest available for each from IBM catalog.
+
+- name: Get all installed group PTFs from system
+  ibm.power_ibmi.ibmi_sql_query:
+    sql: >
+      SELECT PTF_GROUP_NAME, PTF_GROUP_LEVEL, PTF_GROUP_STATUS, PTF_GROUP_DESCRIPTION
+      FROM QSYS2.GROUP_PTF_INFO
+      WHERE PTF_GROUP_STATUS IN ('INSTALLED', 'PARTIALLY APPLIED', 'NOT APPLIED')
+      ORDER BY PTF_GROUP_NAME
+  register: r_installed_groups
+  changed_when: false
+  failed_when: false
+
+- name: Build list of installed group IDs for catalog check
+  ansible.builtin.set_fact:
+    ibmi_installed_group_ids: "{{ r_installed_groups.row | map(attribute='PTF_GROUP_NAME') | list }}"
+
+- name: Check latest available levels for all installed groups
+  ibm.power_ibmi.ibmi_fix_group_check:
+    groups: "{{ ibmi_installed_group_ids }}"
+  register: r_groups_available
+  changed_when: false
+  failed_when: false
+  when: ibmi_installed_group_ids | length > 0
+
+# ── 4. Count PTFs by status ───────────────────────────────────────────────────
+
+- name: Get PTF counts by status
+  ibm.power_ibmi.ibmi_sql_query:
+    sql: >
+      SELECT PTF_STATUS_SUMMARY, COUNT(*) AS PTF_COUNT
+      FROM QSYS2.PTF_INFO
+      GROUP BY PTF_STATUS_SUMMARY
+      ORDER BY PTF_COUNT DESC
+  register: r_ptf_counts
+  changed_when: false
+  failed_when: false
+
+- name: Check for PTFs requiring IPL to activate
+  ibm.power_ibmi.ibmi_sql_query:
+    sql: >
+      SELECT COUNT(*) AS PENDING_IPL
+      FROM QSYS2.PTF_INFO
+      WHERE PTF_STATUS_SUMMARY = 'PENDING-IPL'
+  register: r_pending_ipl
+  changed_when: false
+  failed_when: false
+
+# ── 5. Build group summary lines ──────────────────────────────────────────────
+
+- name: Build group PTF summary with installed vs available
+  ansible.builtin.set_fact:
+    ibmi_group_summary: >-
+      {%- set available_map = {} -%}
+      {%- for g in r_groups_available.group_info | default([]) -%}
+        {%- set _ = available_map.update({g.ptf_group_number: g.ptf_group_level | int}) -%}
+      {%- endfor -%}
+      {%- set lines = [] -%}
+      {%- for g in r_installed_groups.row | default([]) -%}
+        {%- set installed = g.PTF_GROUP_LEVEL | int -%}
+        {%- set available = available_map.get(g.PTF_GROUP_NAME, '?') -%}
+        {%- set behind = ' *** BEHIND ***' if (available != '?' and installed < available | int) else '' -%}
+        {%- set desc = g.PTF_GROUP_DESCRIPTION | default('') | truncate(30, True, '') -%}
+        {%- set _ = lines.append(g.PTF_GROUP_NAME ~ ' (' ~ desc ~ ') : installed ' ~ installed ~ ' / available ' ~ available ~ ' — ' ~ g.PTF_GROUP_STATUS ~ behind) -%}
+      {%- endfor -%}
+      {{ lines }}
+
+# ── 6. Summary ────────────────────────────────────────────────────────────────
+
+- name: IBM i PTF status summary
+  ansible.builtin.debug:
+    msg: "{{ [
+      '===== IBM i PTF Status =====',
+      'Host            : ' ~ (IBMi_Name | default(inventory_hostname)),
+      'OS version      : ' ~ ibmi_os_version,
+      '── Cumulative PTF ──────────────────────────────',
+      'CUM (' ~ ibmi_cum_group ~ ') : installed ' ~ (r_cum_installed.row[0].PTF_GROUP_LEVEL | default('?')) ~ ' / available ' ~ (r_cum.group_info[0].ptf_group_level | default('?')) ~ ((' *** BEHIND ***') if (r_cum_installed.row[0].PTF_GROUP_LEVEL | default(0) | int < r_cum.group_info[0].ptf_group_level | default(0) | int) else ''),
+      '── Group PTFs ──────────────────────────────────'
+    ] + ibmi_group_summary + [
+      '── PTF Counts ──────────────────────────────────',
+      'By status       : ' ~ (r_ptf_counts.row | default([])),
+      'Pending IPL     : ' ~ (r_pending_ipl.row[0].PENDING_IPL | default('0')),
+      '───────────────────────────────────────────────'
+    ] }}"
